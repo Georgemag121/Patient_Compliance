@@ -1,0 +1,429 @@
+---
+title: "Patient Compliance"
+author: "George Yang"
+date: "8/14/2019"
+output: 
+  html_document:
+        toc: yes
+        theme: cosmo
+        highlight: tango
+---
+
+```{r md_setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(include = TRUE)
+knitr::opts_chunk$set(tidy.opts = list(width.cutoff = 60), tidy = TRUE, warning = F)
+require(tidyverse)
+require(knitr)
+
+options(scipen = 999)
+```
+
+# 1. Project Overview
+
+This Project aims to investigate the patient compliance (adherence) based on medication data from AdhereTech's pill bottles. The bottle is an Electronic Medication Packaging (EMP) device that records prescription and dosage taking information. After cleaning the dataset, I will explore adherence measurement and calculation strategies from peer reviewed articles and furthur look into ways to predict missed doses and disenrollment. 
+
+# 2. Data
+
+## 2-1) Loading Data
+```{r}
+df.raw <- read.csv("sample_doses (1).csv", stringsAsFactors = F)
+```
+
+## 2-2) Cleaning Data
+
+### (i) Overview
+```{r}
+summary(df.raw)
+```
+
+As shown, there are 100,000 records with 8 fields. With 330 NA's in Patient ID, I will first determine the nature of the missing values.
+
+```{r}
+# df.raw[which(is.na(df.raw$Patient.ID)), ]
+# Missing values appear to be empty records at the tail of the table and I will get rid of those rows.
+
+df1 <- df.raw[which(!is.na(df.raw$Patient.ID)), ]
+
+# Then check for missing values in Outcome
+sum(is.na(df1$Outcome))
+
+# No missing values
+```
+
+I will then check for duplicate records.
+
+```{r}
+dim(distinct(df1))[1]
+
+# 3 duplicates
+
+df1 <- distinct(df1)
+```
+
+
+### (ii) Dates
+```{r}
+# Dates
+df1$Enroll.Date <- as.Date(df1$Enroll.Date, format = "%m/%d/%Y")
+df1$End.Date <- as.Date(df1$End.Date, format = "%m/%d/%Y")
+df1$Date.Recorded <- as.Date(df1$Date.Recorded, format = "%m/%d/%Y")
+
+```
+
+For Activation.Time, some are in the form of date-time while others are unrecognizable (e.g. Patient ID 5261 has Activation Time "23:16.0"). For the unrecognizable ones, the .csv shows everything in the format xx:xx.0 as 12:xx:xx AM. However, this seems illogical as it is highly unlikely that all patients whose activation time is missing the date portion happened to activate the bottle during the same hour of day (12AM). On the other hand, even for the ones with date-time, there are still some inconsistencies between the Activation Time and the first Date/Time Recorded for that patient (some completely match up, while others have different date or time). As a result, I don't have enough information to recover this column and I will leave them as they are for now. Moreover, the Activation Time is not particularly relevant in the analysis I will conduct.  
+
+### (iii) Times
+
+For Time.Recorded and Deadline, the number of days is irrelevant (always 0) as there is a record for each day and the time after the decimal point appear to be a string of 0s. Here's how I test for these two assumptions.
+```{r}
+table(substr(df1$Time.Recorded, 1, 7))
+table(substr(df1$Time.Recorded, 16, 26))
+
+table(substr(df1$Deadline, 1, 7))
+table(substr(df1$Deadline, 16, 26))
+```
+
+Given the results, I will simplify these two columns into time objects as hh:mm:ss.
+
+```{r}
+df1$Time.Recorded <- substr(df1$Time.Recorded, 8, 15)
+df1$Deadline <- substr(df1$Deadline, 8, 15)
+```
+
+## 2-3) Further Inspection of the Dataset
+
+After cleaning the dataset, I inspected the dataset to better understand it and to find anomalies. First and foremost, the dataset is arranged by Patient ID (or enrollment date, as Patient IDs are most likely generated from order of enrollment in some form) and Date Recorded (for each patient). So I came up with the following hypotheses about the dataset and I will then test them.  
+
++ (I) For each patient, there is a single record for each day he/she is enrolled   
++ (II) The enrollment spans the entire range from enrollment day to End.Date or Current.Date (or the dataset)   
++ (III) The data for each patient should consist of blocks with 21 days of doses and 7+ days of rests except for the head and tail   
++ (IV) Date.Recorded and Deadline represent the daily ping and the Deadline remains the same throughout the enrollment period   
++ (V) Time.Recorded is not tied to Date.Recorded and it simply represent the time, and the date can be the day of, after, or before (say if the deadline is 11:30PM everyday, the patient could take the pill after midnight, and the time would not be considered as the next day)   
++ (VI) There are defined time windows for the the dose to be characterized as on time (+/- 1hr), not on time (LATE or EARLY), and missed   
+
+### (i) Hypothesis I and II
+I will first start with the first two hypotheses.  
+```{r}
+# Test for first two
+df.test1 <- df1 %>% 
+  group_by(Patient.ID) %>% 
+  summarize(Count = n(),
+            Timespan = ifelse(Count == 1, 0, as.numeric(diff.Date(range(Date.Recorded, na.rm = T))) + 1),
+            DateCheck = Count == Timespan,
+            Enroll.Date = first(Enroll.Date), 
+            End.Date = first(End.Date))
+
+df.test1 %>% filter(DateCheck == F)
+
+# df1 %>% filter(Patient.ID == xxxx) to check why these are outliers
+
+OddCases <- df.test1 %>% filter(DateCheck == F) %>% pull(Patient.ID)
+```
+
+After checking, there are 14 patients that are out of the ordinary. There are three cases:  
+
+1. Only 1 row of record and the patient has already ended the enrollment (7 cases, ID: 4403, 4543, 5925, 5946, 6043, 6385, 6817)  
+
+2. There are more records than the length of the time span, meaning that there are days where more than one dose is administered, making them not 21 ON 7 OFF patients. (2 cases, ID: 5261, 6150)  
+
+3. There are fewer records than the length of the time span, meaning that the system has had gaps during the enrollment period. (5 cases, ID: 5495, 5817, 5924, 6142, 6202)  
+
+
+For now (calculating adherence), I think it would be best to exclude them from the analysis. The reasons are quite obvious for the first two groups: the first one with no recorded actions (and unclear whether the patient was ever enrolled in the first place) and the second one doesn't fit the target population (of the analysis). For the third group, I will also eliminate these cases as I can't be sure of the cause and don't have a method to account for the gaps during enrollment. Overall, I will also assume that these outliers are by random and excluding them will not create meaningful bias for my analysis.  
+
+### (ii) Hypothesis III
+
+I will move on to the next assumption after removing these patients. Also, I will assume that if the Outcome is PAUSED, the patient is not supposed to take the dose on the day (OFF period). Otherwise, the patient should take a single dose (Outcome as MISSED, EARLY, LATE, or ONTIME). In other words, the Outcome variable in the dataset corresponds to doctors' prescriptions.  
+
+```{r}
+# df1.N is a new dataframe with no odd cases
+df1.N <- df1 %>% 
+  filter(!Patient.ID %in% OddCases) %>% 
+  mutate(Period.Status = ifelse(Outcome == "PAUSED", "OFF", "ON"))
+
+# use run-length encoding (rle) to transform the ON/OFF status into vector of streaks
+PIDs <- unique(df1.N$Patient.ID)
+N <- length(PIDs)
+
+# initialize the rle object
+streaks <- df1.N %>% filter(Patient.ID == PIDs[1]) %>% pull(Period.Status) %>% rle()
+
+# append current rle object with data from a new patient
+for (id in PIDs[-1]) {
+  tmp.rle <- df1.N %>% filter(Patient.ID == id) %>% pull(Period.Status) %>% rle()
+  streaks[[1]] <- c(streaks[[1]], tmp.rle[[1]])
+  streaks[[2]] <- c(streaks[[2]], tmp.rle[[2]])
+}
+
+# create a new vector for grouping of sessions
+df1.N <- df1.N %>% mutate(Period.Group = rep(1:length(streaks[[1]]), streaks[[1]]))
+
+on.streaks <- streaks[[1]][which(streaks[[2]] == "ON")]
+
+summary(on.streaks)
+head(table(on.streaks), 30)
+```
+
+As shown in the table output, the ON period is not strictly 21 days. And for some extreme cases (not shown here in the table), the ON period would last for several months (max is 303 days). Therefore, the schedules appear to be quite laxed and I am not sure if this is the intention of the doctors or not. As it stands, I will simply assume that variations in scheduling is OK (or the analysis might get very complicated and messy). 
+
+### (iii) Hypothesis IV
+
+I will then check if there is a singular Deadline throughout the enrollment period for each patient (already without the two patients that has a period where they were supposed to take multiple doses in one day).  
+
+```{r}
+ddl.check <- rep(NA, N)
+for (i in 1:N) {
+  tmp.tab <- xtabs(~ Deadline + Patient.ID, data = df1.N %>% filter(Patient.ID == PIDs[i]))
+  ddl.check[i] <- dim(tmp.tab)[1] == 1
+}
+
+summary(ddl.check)
+```
+
+The result confirms that patients indeed have a consistent deadline throughout the enrollment period.  
+
+### (iv) Hypothesis V and VI
+
+Then, to test the last two hypotheses, I will first generate a column showing the difference in minutes between the deadline and when the patient takes the dose.  
+
+```{r}
+df1.N[14, ]
+```
+
+For the record above, we can see that the patient took the dose at 11PM and the deadline is 1AM, however, the status show that he/she took the med early. The only logical explanation would be the hypothesis that the Time.Recorded represents a time within the 24 hour window apart from the deadline, and the Outcome (EARLY, LATE, ONTIME) would then determine the exact day. With that in mind, I will calculate the time difference based on the Outcome variable.  
+
+```{r}
+# Define the time difference function 
+# first convert everything to seconds, then calculate time difference based on the status
+time.diff <- function(t1, t2, type) {
+  ts1 <- as.numeric(as.difftime(t1, units = "secs"))
+  ts2 <- as.numeric(as.difftime(t2, units = "secs"))
+  
+  td <- ifelse(type == "ONTIME", ifelse(ts1 >= ts2, 
+                                        ifelse(ts1 - ts2 >= 72000, round((ts1 - ts2 - 84000)/60, 2), 
+                                               round((ts1 - ts2)/60, 2)),
+                                        ifelse(ts2 - ts1 >= 72000, round((ts1 - ts2 + 84000)/60, 2),
+                                               round((ts1 - ts2)/60, 2))), 
+        ifelse(type == "EARLY", ifelse(ts2 >= ts1, round((ts1 - ts2)/60, 2), round((ts1 - ts2 - 86400)/60, 2)),
+        ifelse(type == "LATE", ifelse(ts1 >= ts2, round((ts1 - ts2)/60, 2), round((ts1 - ts2 + 86400)/60, 2)),
+        NA)))
+  
+  return(td)
+}
+
+df1.N <- df1.N %>% mutate(Time.Diff = time.diff(Time.Recorded, Deadline, Outcome))
+```
+
+The new Time.Diff column is the deviation of Time.Recorded in minutes from the Deadline and negative time means taking the dose before the deadline and vice versa.  
+
+```{r}
+# ggplot theme
+theme1 <- list(theme(panel.grid.minor = element_blank(),
+                    plot.background = element_blank()))
+
+df1.N %>% 
+  filter(Outcome %in% c("ONTIME", "EARLY", "LATE")) %>% 
+  ggplot(aes(x = factor(Outcome, levels = c("EARLY", "ONTIME", "LATE")), y = Time.Diff)) + 
+  geom_violin(col = "red", alpha = 0.6) + 
+  geom_jitter(aes(x = factor(Outcome, levels = c("EARLY", "ONTIME", "LATE")), y = Time.Diff), col = "orange", alpha = 0.05, size = 0.1) + 
+  geom_hline(yintercept = c(-60, 60), linetype = 5, size = 0.8, col = "blue", alpha = 0.6) + 
+  ggtitle("Violin Plot of Distribution of Time Difference on Outcomes") +
+  xlab("Outcome") + 
+  ylab("Time Difference in Minutes") + 
+  coord_flip() +
+  theme1
+```
+
+From the plot above, as well as statistical distributions, we can say that within this dataset, +/- 1hr window would be the definition for being on time.  
+
+Now, all the hypotheses (6) for the dataset have been tested and all but the one about 21-day ON periods have been corroborated. With a better understanding of the structure of this dataset, I will now move on to the analysis.  
+
+# 3. Patient Compliance
+## 3-1) Set Up and Theoretical Framework
+
+After reviewing DiMatteo's (2004) meta analysis, patient compliance (adherence) refers to how well the patients take doses according to prescription, and it's been measured through interviews, personal accounts, refill activities, and more recently eletronic monitoring devices [^1]. Although EMP (eletronic monitoring) devices tend to provide more detailed and accurate data, few researchers have explored that front and most chose to stick to definitions consistent with those that are compatible with data acquired from the more traditional methods [^2]. More specifically, adherence rate can be defined in two ways, both presented in a percentage. For vast majority of the cases, it describes the percentage of samples (patients) that are adherent (dichotomous, vs. non-adherent) from a given set of rules of defining each individual's adherence; on the other hand, 3% of the studies would define adherence as the total percentage of prescription covered. However, there has not been a consensus on the best practice of defining whether an individual patient is adherent or not and this process is often context dependent.  
+
+For this project, I will choose the common two step approach to define adherence rate, first calculating each patient-level adherence, and then use a threshold to divide individual patients into adherent/non-adherent ones before calculating the adherence rate for these 21 ON 7 OFF patients. 
+
+In step one, there are many ways to define the patient-level adherence [^3]. Among them, MPR (Medication Possession Ratios) and PDC (Proportion of Days Covered) are most popular. MPR itself has different variations but all focuses on medication supply over a period of time and can be unreliable when there are pauses (as patient only makes sporadic visits for refill). In comparison, PDC, also with several variations, could potentially hand pauses and eliminate the Off period from the denominator [^4]. For this dataset, I will use a PDC measurement and calculate the percentage of days where the patient took the dose (not MISSED) when they are supposed to (ON period).  
+
+In step two, the studies that used PDC for patient-level adherence all suggested a 80% cutoff for determining whether an individual patient is adherent or not and I will stick to that level for this project.  
+
+Finally, I also need have to assume that patients would always take one dose for everytime they open the bottle and create a timestamp. In fact, this is supported by Vrijens and Urquhart [^5], who claim that when pill boxes are opened, doses are likely to be taken (97% accuracy).  
+
+## 3-2) Adherence Rate
+### (i) Adherence Rate
+```{r}
+df.ar.all <- df1.N %>% 
+  # filter out the days when patients are supposed to take a dose
+  filter(Period.Status == "ON") %>%
+  # use group by to get patient-level PDC
+  group_by(Patient.ID) %>%
+  summarize(Ended = ifelse(is.na(first(End.Date)), "Enrolled", "Ended"), 
+            Total = n(), 
+            Total.Missed = sum(Outcome == "MISSED"), 
+            Total.ONTIME = sum(Outcome == "ONTIME"),
+            Total.Covered = Total - Total.Missed, 
+            PDC = Total.Covered/Total,
+            Adherence = PDC >= 0.8)
+
+# visualize the adherence rate
+df.ar.all %>% 
+  arrange(desc(PDC), desc(Total)) %>% 
+  rowid_to_column("New.ID") %>% 
+  ggplot(aes(x = factor(New.ID), 
+             y = PDC,
+             fill = Total,
+             width = 1)) +
+  geom_bar(stat = "identity", position = "identity") + 
+  scale_fill_viridis_c(alpha = 0.5,
+                       begin = 0.9,
+                       end = 0.5) +
+  geom_hline(yintercept = 0.8, linetype = 5, size = 0.8, col = "red") +
+  scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) + 
+  xlab("Patients") +
+  ggtitle("Patient-Level Compliance") + 
+  theme_bw() + 
+  theme(axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        panel.grid = element_blank(), 
+        panel.border = element_blank())
+
+# Adherence Rate
+ar.all <- mean(df.ar.all$Adherence)
+ar.all
+```
+
+In the plot of individual PDC for patients above, the red line represents the 0.80 cutoff for patient-level compliance and the color fill represents the total number of days with doses prescribed (the length of ON period during enrollment). After calculation, the overall Adherence Rate is `r round(ar.all * 100, 1)`%, or `r sum(df.ar.all$Adherence)` out of N = `r nrow(df.ar.all)` eligible patients (total of 307, with 14 excluded) that met the adherence criteria (PDC $\geq$ 80%). To put it into context, from DiMatteo's 2004 meta-analysis [^1], the adherence rate of `r round(ar.all * 100, 1)`% is higher than the upper bound of the 95% confidence interval for 328 studies on medication adherence ($\mu$ = 0.794, ci = (0.774, 0.814)). 
+
+### (ii) Other Interesting Findings
+With limited features in the dataset, I will engineer a few extra features into the dataset based on existing variables. In the following section, I have conducted a several analyses about patient adherence.  
+
+#### Adherence and Enrollment
+
+I am interested in finding out whether being currently enrolled is independent of the patient being adherent. I will use a $\chi^2$ test on the contingency table.  
+
+```{r}
+table(df.ar.all$Adherence, df.ar.all$Ended)
+
+test1 <- chisq.test(table(df.ar.all$Adherence, df.ar.all$Ended))
+
+test1
+```
+
+With a p-value of `r round(test1$p.value, 3)`, we accept the null that enrollment status and adherence are independent.  
+
+#### Timing of Dose
+
+Although there has been a lack of research in the area, I think the distinction between taking the dose on time and or not is quite relevant (even more so for some medication, e.g. drugs that regulate blood glucose level). In this dataset, a +/- 1hr window is used to determine the on time status but in a study I found, the author used a +/- 2hr window for timely doses [^6]. For now, I will stick to the definition in this dataset and create the total count of doses that are not just taken, but taken on time.  
+
+Then I will create a binary variable to indicate whether the On Time Rate (ONTIME/Covered) for a certain patient is higher or lower than the average. From there, I will conduct a similar $\chi^2$ test of independence to the one I did above.  
+
+```{r}
+otr.all <- sum(df.ar.all$Total.ONTIME)/sum(df.ar.all$Total.Covered)
+
+df.ar.all <- df.ar.all %>% 
+  mutate(OTR = Total.ONTIME/Total.Covered,
+         OT.Binary = ifelse(OTR >= otr.all,
+                            "High",
+                            "Low"))
+
+table(df.ar.all$Adherence, df.ar.all$OT.Binary)
+
+test2 <- chisq.test(table(df.ar.all$Adherence, df.ar.all$OT.Binary))
+
+test2
+```
+
+With a p-value of `r round(test2$p.value, 3)`, at $\alpha$ = 0.05 level, we will reject the null and conclude that there is a relationship between On Time Rate and adherence.  
+
+To further explore the relationship, I will then use a logistic model to predict adherence with on time doses, total days, and enrollment status (not including days covered, otherwise we would be able to fully recover the adherence since it's a calculated metric). In a way, this model explores if a stricter definition of adherence (On Time Doses vs. Doses that just cover the day regardless of time) would generate a similar result. 
+
+```{r}
+m1 <- glm(Adherence ~ Total + Total.ONTIME + Ended, family = "binomial", data = df.ar.all)
+p1 <- predict(m1, type = "response")
+
+# Utilize a 0.5 cutoff
+pred1 <- ifelse(p1 >= 0.5, 1, 0)
+
+ct1 <- table(pred1, df.ar.all$Adherence)
+
+ct1
+```
+
+This model has an accuracy of `r round(mean(pred1 == df.ar.all$Adherence) * 100, 1)`%, with high sensitivity `r round(ct1[2, 2]/(ct1[1, 2] + ct1[2, 2])*100, 1)`%, and low specificity `r round(ct1[1, 1]/(ct1[1, 1] + ct1[2, 1])*100, 1)`%. Overall, this model can predict adherence (more relaxed definition) with high accuracy.  
+
+In all, the timing of doses is not widely studied, especially when researchers have not even agreed upon a gold standard for medication adherence. With that said, there is huge potential in this topic and instead of a hard cutoff for being on time, it could be a continuous variable that facilitates analysis on medication absorption (and concentration) curve.  
+
+#### Adherence Rate Over Time
+
+In this section, I have split the data into blocks of ON periods and calculated cumulative PDC over time. This would provide insights into how patients' compliance evolve over their enrollment period. I have also created different groups based on enrollment status and adherence type. Enrollment status is straightforward (binary) while adherence has four types:  
+
++ Adherent: The patient was always adherent (cumulative PDC $\geq$ 80%) throughout the entire enrollment period  
++ Non-Adherent: The patient was never adherent (cumulative PDC $\geq$ 80%) throughout the entire enrollment period  
++ Partially Adherent Type A: The patient was only at times adherent (cumulative PDC $\geq$ 80%) and end up adherent (overall PDC $\leq$ 80%) over the entire enrollment period  
++ Partially Adherent Type B: The patient was only at times adherent (cumulative PDC $\geq$ 80%) and end up not adherent (overall PDC $\leq$ 80%) over the entire enrollment period  
+
+```{r}
+df.ar.period <- df1.N %>% 
+  filter(Period.Status == "ON") %>%
+  group_by(Patient.ID, Period.Group) %>%
+  summarize(Ended = ifelse(is.na(first(End.Date)), "Enrolled", "Ended"),
+            First.Day = first(Date.Recorded), 
+            Last.Day = last(Date.Recorded),
+            N = n(), 
+            Missed = sum(Outcome == "MISSED"), 
+            Covered = N - Missed, 
+            Current.Period.PDC = Covered/N) %>% 
+  mutate(Period.ID = sequence(n()),
+         Total.Periods = max(Period.ID),
+         Total = cumsum(N),
+         Total.Missed = cumsum(Missed),
+         Total.Covered = Total - Total.Missed,
+         Cumulative.PDC = Total.Covered/Total,
+         Min.PDC = min(Cumulative.PDC),
+         Max.PDC = max(Cumulative.PDC),
+         Adherence.Type = ifelse(Min.PDC >= 0.8, "Adherent", 
+                         ifelse(Max.PDC < 0.8, "Non-Adherent", 
+                         ifelse(last(Cumulative.PDC) >= 0.8, "Partially.Adherent.A", "Partially.Adherent.B"))))
+
+df.ar.period %>%
+  ggplot() + 
+  geom_line(aes(x = First.Day, 
+                y = Cumulative.PDC, 
+                group = factor(Patient.ID),
+                col = Total.Periods), 
+            alpha = 0.5) +
+  scale_color_viridis_c() +
+  facet_grid(Adherence.Type ~ Ended) +
+  xlab("Date") + 
+  ylab("Cumulative PDC") + 
+  ggtitle("Adherence Rate Over Time by Enrollment Status and Adherence Type") + 
+  theme1
+```
+
+Due to time constraint, I only created this visualization without coming up with detailed statistical models. From the plot, somewhat trivially, we can tell that those who are still enrolled generally last longer (lighter in color) than those who dropped out. Also, the shape of the curves appear to be different for different adherence types.  
+
+This segmentation of periods could be meaningful in other ways and I will further explain the benefits in the following section on the potential to predict Missed Doses and Disenrollment.  
+
+# 4. Predicting Missed Doses and Disenrollment
+
+Within the current dataset, we can reasonably assume that each patients are independent of each other yet the repeated measures of daily dosing activity ("Outcome") for a certain patient should have some correaltion strucutre (the effect of habits). To capture these two features, either a GEE (Generalized Estimating Equations) model or a GLMM (Generalized Linear Mixed Model) would be appropriate in this case. After tuning for the best performing model or taking a bayesian approach (MCMC GLMM), prediction of Missed Doses and Disenrollment should be possible.  
+
+Alternatively, we could also adopt machine learning techniques and let the algorithms capture the intricacy of the dataset. In this case, a tree-based algorithm (random forest) or SVM (Support Vector Machine) should also help us make predictions.  
+
+Either way, it would make the predictions much more accurate if demographic information is also available. Almost all of the studies I have reviewed (for the definition/calculation of patient adherence) utilized demographic information for analysis. These features are proven to be good predictors in such settings and should help improve accuracy. Additionally, there are other factors that could have huge impacts on Missed Doses and Disenrollment. For one, dissatisfaction (of the medication or the technology) could lead to the patient opting out yet death/cure would surely also result in disenrollment. These two causes for disenrollment have very different nature and we should distinguish between them for a multitude of reasons. On the other hand, the patients' interaction with the doctors and details about the disease and the pills would also help provide us a better idea of their medication taking activities.  
+
+
+[^1]: DiMatteo, M. Robin. "Variations in patients' adherence to medical recommendations: a quantitative review of 50 years of research." Medical care (2004): 200-209.
+
+[^2]: Liu, Honghu, et al. "A comparison study of multiple measures of adherence to HIV protease inhibitors." Annals of internal medicine 134.10 (2001): 968-977.
+
+[^3]: Tang, Karen L., Hude Quan, and Doreen M. Rabi. "Measuring medication adherence in patients with incident hypertension: a retrospective cohort study." BMC health services research 17.1 (2017): 135.
+
+[^4]: Nau, David P. "Proportion of days covered (PDC) as a preferred method of measuring medication adherence." Springfield, VA: Pharmacy Quality Alliance (2012).
+
+[^5]: Vrijens, B., and J. Urquhart. "Methods for measuring, enhancing, and accounting for medication adherence in clinical trials." Clinical Pharmacology & Therapeutics 95.6 (2014): 617-626.
+
+[^6]: Choo, Peter W., et al. "Derivation of adherence metrics from electronic dosing records." Journal of clinical epidemiology 54.6 (2001): 619-626.
